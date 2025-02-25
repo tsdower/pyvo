@@ -118,14 +118,18 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
         session : object
            optional session to use for network requests
         """
-        super().__init__(baseurl, session=session, capability_description=capability_description)
+        try:
+            super().__init__(baseurl, session=session, capability_description=capability_description)
 
-        # Check if the session has an update_from_capabilities attribute.
-        # This means that the session is aware of IVOA capabilities,
-        # and can use this information in processing network requests.
-        # One such use case for this is auth.
-        if hasattr(self._session, 'update_from_capabilities'):
-            self._session.update_from_capabilities(self.capabilities)
+            # Check if the session has an update_from_capabilities attribute.
+            # This means that the session is aware of IVOA capabilities,
+            # and can use this information in processing network requests.
+            # One such use case for this is auth.
+            if hasattr(self._session, 'update_from_capabilities'):
+                self._session.update_from_capabilities(self.capabilities)
+        except DALServiceError as e:
+            raise DALServiceError(f"Cannot find TAP service at '"
+                                  f"{baseurl}'.\n\n{str(e)}") from None
 
     def get_tap_capability(self):
         """
@@ -282,7 +286,7 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
 
     def run_async(
             self, query, *, language="ADQL", maxrec=None, uploads=None,
-            **keywords):
+            delete=True, **keywords):
         """
         runs async query and returns its result
 
@@ -297,6 +301,8 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
             the maximum records to return. defaults to the service default
         uploads : dict
             a mapping from table names to objects containing a votable
+        delete : bool
+            delete the job after fetching the results
 
         Returns
         -------
@@ -323,7 +329,9 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
         job = job.run().wait()
         job.raise_if_error()
         result = job.fetch_result()
-        job.delete()
+
+        if delete:
+            job.delete()
 
         return result
 
@@ -369,8 +377,6 @@ class TAPService(DALService, AvailabilityMixin, CapabilityMixin):
 
         Parameters
         ----------
-        baseurl : str
-            the base URL for the TAP service
         query : str
             the query string / parameters
         mode : str
@@ -643,7 +649,7 @@ class AsyncTAPJob:
         job = cls(response.url, session=session)
         return job
 
-    def __init__(self, url, *, session=None):
+    def __init__(self, url, *, session=None, delete=True):
         """
         initialize the job object with the given url and fetch remote values
 
@@ -651,9 +657,14 @@ class AsyncTAPJob:
         ----------
         url : str
             the job url
+        session : object, optional
+            session to use for network requests
+        delete : bool, optional
+            whether to delete the job when exiting (default: True)
         """
         self._url = url
         self._session = use_session(session)
+        self._delete_on_exit = delete
         self._update()
 
     def __enter__(self):
@@ -664,12 +675,15 @@ class AsyncTAPJob:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
-        Exits the context. The job is silently deleted.
+        Exits the context. Unless delete=False was set at initialization,
+        the job is deleted. Any deletion errors are silently ignored
+        to ensure proper context exit.
         """
-        try:
-            self.delete()
-        except Exception:
-            pass
+        if self._delete_on_exit:
+            try:
+                self.delete()
+            except DALServiceError:
+                pass
 
     def _update(self, wait_for_statechange=False, timeout=10.):
         """
@@ -849,14 +863,14 @@ class AsyncTAPJob:
     @property
     def result(self):
         """
-        The job result if exists
+        Returns the UWS result with id='result' if it exists, otherwise None.
         """
         try:
             for r in self._job.results:
                 if r.id_ == 'result':
                     return r
 
-            return self._job.results[0]
+            return None
         except IndexError:
             return None
 
@@ -873,7 +887,10 @@ class AsyncTAPJob:
         the uri of the result
         """
         try:
-            uri = self.result.href
+            result = self.result
+            if result is None:
+                return None
+            uri = result.href
             if not urlparse(uri).netloc:
                 uri = urljoin(self.url, uri)
             return uri
@@ -928,6 +945,8 @@ class AsyncTAPJob:
         ----------
         phases : list
             phases to wait for
+        timeout : float
+            maximum time to wait in seconds
 
         Raises
         ------
@@ -995,6 +1014,12 @@ class AsyncTAPJob:
         """
         returns the result votable if query is finished
         """
+        result_uri = self.result_uri
+        if result_uri is None:
+            self._update()
+            self.raise_if_error()
+            raise DALServiceError("No result URI available", self.url)
+
         try:
             response = self._session.get(self.result_uri, stream=True)
             response.raise_for_status()
